@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QR scanner bridge</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #111; color: #fff; font: 16px/1.4 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #reader { flex: 1; min-height: 0; overflow: hidden; }
+  #bar { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); background: #1b1b1b; text-align: center; }
+  #bar.error { background: #7a1f1f; }
+  #startBtn { margin-top: 8px; padding: 12px 20px; font-size: 16px; border: 0; border-radius: 10px; background: #2b7fff; color: #fff; }
+  #flash { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; padding: 24px; font-size: 28px; font-weight: 700; z-index: 10; }
+  #flash.show { display: flex; }
+  #flash.ok { background: rgba(20, 140, 60, .94); }
+  #flash.duplicate { background: rgba(200, 130, 0, .94); }
+  #flash.bad { background: rgba(170, 30, 30, .94); }
+  #flash.info { background: rgba(40, 80, 160, .94); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="reader"></div>
+<div id="flash"></div>
+<div id="bar">
+  <div id="statusText">Connecting to the check-in app…</div>
+  <button id="startBtn" class="hidden">Start camera</button>
+</div>
+
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // Pages that may receive scan results. Apps Script web apps render inside an iframe served from
+  // *.googleusercontent.com. If you see "Blocked: unexpected opener origin ...", add that origin here.
+  const ALLOWED_OPENERS = [
+    /^https:\/\/[a-z0-9-]+\.googleusercontent\.com$/,
+    /^https:\/\/script\.google\.com$/
+  ];
+  const RESEND_EVERY_MS = 4000;
+  const MAX_TRIES = 5;
+  const COOLDOWN_MS = 5000;
+
+  const $ = function (id) { return document.getElementById(id); };
+  const bar = $('bar'), statusText = $('statusText'), flash = $('flash'), startBtn = $('startBtn');
+
+  let openerOrigin = null;   // set only after a valid INIT from an allowed origin
+  let mode = 'single';       // 'single' = send one scan and close, 'continuous' = keep scanning
+  let scanner = null, starting = false, flashTimer = null, readyTries = 0;
+  const pending = new Map();   // scan id -> { msg, tries } (continuous mode, waiting for ACK)
+  const lastSeen = new Map();  // qr text -> timestamp (debounce)
+
+  function setStatus(text, isError) {
+    statusText.textContent = text;
+    bar.classList.toggle('error', !!isError);
+  }
+
+  function showFlash(kind, text, ms) {
+    flash.className = 'show ' + kind;
+    flash.textContent = text;
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(function () { flash.className = ''; }, ms || 1200);
+  }
+
+  function openerAlive() { return window.opener && !window.opener.closed; }
+
+  // Always posts to the verified opener origin, never '*'.
+  function post(msg) {
+    if (!openerOrigin || !openerAlive()) return false;
+    window.opener.postMessage(msg, openerOrigin);
+    return true;
+  }
+
+  // ---------------------------------------------------------------- scanning
+
+  function onDecode(text) {
+    const now = Date.now();
+    const seen = lastSeen.get(text);
+    if (seen && now - seen < COOLDOWN_MS) return;
+    lastSeen.set(text, now);
+
+    const id = window.crypto && crypto.randomUUID
+      ? crypto.randomUUID()
+      : now + '-' + Math.random().toString(16).slice(2);
+    const msg = { type: 'SCAN', id: id, text: text };
+
+    if (!post(msg)) {
+      setStatus('Lost connection to the check-in app. Close this window and open it again.', true);
+      return;
+    }
+    if (navigator.vibrate) navigator.vibrate(40);
+
+    if (mode === 'single') {
+      // Hand over and close: on phones this brings the check-in tab back to the front,
+      // where the result is shown.
+      stopCamera();
+      showFlash('info', 'Sent ✓', 600);
+      setTimeout(function () { window.close(); }, 350);
+      setTimeout(function () { setStatus('Scan sent. You can close this window.'); }, 1200);
+    } else {
+      pending.set(id, { msg: msg, tries: 1 });
+      setStatus('Sending…');
+    }
+  }
+
+  function handleAck(d) {
+    pending.delete(d.id);
+    const map = {
+      ok: ['ok', '✓ Checked in'],
+      duplicate: ['duplicate', 'Already checked in'],
+      invalid: ['bad', 'Invalid QR code'],
+      forbidden: ['bad', 'Not allowed']
+    };
+    const entry = map[d.status] || ['bad', d.message || 'Error'];
+    showFlash(entry[0], entry[1], 1300);
+    setStatus(d.message || entry[1]);
+    if (navigator.vibrate) navigator.vibrate(d.status === 'ok' ? 60 : [80, 60, 80]);
+  }
+
+  // Resend scans that have not been acknowledged (e.g. the app tab was in the background).
+  setInterval(function () {
+    pending.forEach(function (p, id) {
+      if (p.tries >= MAX_TRIES) {
+        pending.delete(id);
+        showFlash('bad', 'No response from the app. Keep the check-in tab open.', 2500);
+        return;
+      }
+      p.tries++;
+      post(p.msg);
+    });
+  }, RESEND_EVERY_MS);
+
+  async function startCamera() {
+    if (starting || scanner) return;
+    starting = true;
+    startBtn.classList.add('hidden');
+    try {
+      scanner = new Html5Qrcode('reader', {
+        formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
+        useBarCodeDetectorIfSupported: true,
+        verbose: false
+      });
+      await scanner.start(
+        { facingMode: 'environment' },
+        {
+          fps: 10,
+          qrbox: function (w, h) {
+            const s = Math.floor(Math.min(w, h) * 0.7);
+            return { width: s, height: s };
+          }
+        },
+        onDecode,
+        function () { /* no QR in this frame */ }
+      );
+      setStatus(mode === 'single'
+        ? 'Point the camera at the QR code.'
+        : 'Scanning… keep the check-in tab open.');
+    } catch (err) {
+      scanner = null;
+      setStatus('Camera unavailable: ' + (err && err.message ? err.message : err), true);
+      startBtn.classList.remove('hidden');
+    } finally {
+      starting = false;
+    }
+  }
+
+  function stopCamera() {
+    if (!scanner) return;
+    const s = scanner;
+    scanner = null;
+    s.stop().then(function () { s.clear(); }).catch(function () {});
+  }
+
+  startBtn.addEventListener('click', startCamera);
+
+  // ---------------------------------------------------------------- handshake
+
+  window.addEventListener('message', function (event) {
+    if (event.source !== window.opener) return;
+    const d = event.data || {};
+
+    if (d.type === 'INIT') {
+      if (!ALLOWED_OPENERS.some(function (rx) { return rx.test(event.origin); })) {
+        setStatus('Blocked: unexpected opener origin ' + event.origin, true);
+        return;
+      }
+      openerOrigin = event.origin;
+      mode = d.mode === 'continuous' ? 'continuous' : 'single';
+      startCamera();
+    } else if (d.type === 'ACK' && openerOrigin && event.origin === openerOrigin) {
+      handleAck(d);
+    }
+  });
+
+  window.addEventListener('pagehide', function () {
+    stopCamera();
+    post({ type: 'BRIDGE_CLOSED' });
+  });
+
+  if (!window.opener) {
+    setStatus('Open this page from the check-in app, not directly.', true);
+    return;
+  }
+
+  // Tell the opener we are ready (carries no data, so '*' is fine); it answers with INIT.
+  function announce() {
+    if (openerOrigin) return;
+    if (++readyTries > 20) {
+      setStatus('The check-in app did not answer. Close this window and try again.', true);
+      return;
+    }
+    window.opener.postMessage({ type: 'BRIDGE_READY' }, '*');
+    setTimeout(announce, 500);
+  }
+  announce();
+})();
+</script>
+</body>
+</html>
