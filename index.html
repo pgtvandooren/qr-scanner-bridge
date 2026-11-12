@@ -41,7 +41,7 @@
     /^https:\/\/script\.google\.com$/
   ];
   const RESEND_EVERY_MS = 4000;
-  const MAX_TRIES = 5;
+  const RESULT_DISPLAY_MS = 2000;
   const COOLDOWN_MS = 5000;
 
   const $ = function (id) { return document.getElementById(id); };
@@ -52,17 +52,25 @@
   let scanner = null, starting = false, flashTimer = null, readyTries = 0;
   const pending = new Map();   // scan id -> { msg, tries } (continuous mode, waiting for ACK)
   const lastSeen = new Map();  // qr text -> timestamp (debounce)
+  let activeScanId = null;
 
   function setStatus(text, isError) {
     statusText.textContent = text;
     bar.classList.toggle('error', !!isError);
   }
 
-  function showFlash(kind, text, ms) {
+  function showFlash(kind, text, ms = 1200) {
     flash.className = 'show ' + kind;
     flash.textContent = text;
+  
     clearTimeout(flashTimer);
-    flashTimer = setTimeout(function () { flash.className = ''; }, ms || 1200);
+    flashTimer = null;
+  
+    if (ms > 0) {
+      flashTimer = setTimeout(function () {
+        flash.className = '';
+      }, ms);
+    }
   }
 
   function openerAlive() { return window.opener && !window.opener.closed; }
@@ -77,59 +85,126 @@
   // ---------------------------------------------------------------- scanning
 
   function onDecode(text) {
+    // Only process one registration at a time.
+    if (activeScanId !== null) return;
+  
     const now = Date.now();
     const seen = lastSeen.get(text);
+  
     if (seen && now - seen < COOLDOWN_MS) return;
+  
     lastSeen.set(text, now);
-
+  
     const id = window.crypto && crypto.randomUUID
       ? crypto.randomUUID()
       : now + '-' + Math.random().toString(16).slice(2);
-    const msg = { type: 'SCAN', id: id, text: text };
-
+  
+    const msg = {
+      type: 'SCAN',
+      id: id,
+      text: text
+    };
+  
+    // Register the pending scan in both modes.
+    activeScanId = id;
+    pending.set(id, {
+      msg: msg,
+      tries: 1,
+      startedAt: now
+    });
+  
+    // Show processing until the app returns a result.
+    showFlash('info', 'Processing check-in…', 0);
+    setStatus('Waiting for Dynamics confirmation…');
+  
+    // Send to the check-in application.
     if (!post(msg)) {
-      setStatus('Lost connection to the check-in app. Close this window and open it again.', true);
+      pending.delete(id);
+      activeScanId = null;
+  
+      showFlash('bad', 'Connection lost', 3000);
+      setStatus(
+        'Lost connection to the check-in app. Close this window and try again.',
+        true
+      );
       return;
     }
+  
     if (navigator.vibrate) navigator.vibrate(40);
-
-    if (mode === 'single') {
-      // Hand over and close: on phones this brings the check-in tab back to the front,
-      // where the result is shown.
-      stopCamera();
-      showFlash('info', 'Sent ✓', 600);
-      setTimeout(function () { window.close(); }, 350);
-      setTimeout(function () { setStatus('Scan sent. You can close this window.'); }, 1200);
-    } else {
-      pending.set(id, { msg: msg, tries: 1 });
-      setStatus('Sending…');
-    }
   }
 
   function handleAck(d) {
+    // Ignore acknowledgements for unknown or completed scans.
+    if (d.id !== activeScanId || !pending.has(d.id)) return;
+  
+    const current = pending.get(d.id);
     pending.delete(d.id);
+  
     const map = {
       ok: ['ok', '✓ Checked in'],
       duplicate: ['duplicate', 'Already checked in'],
       invalid: ['bad', 'Invalid QR code'],
       forbidden: ['bad', 'Not allowed']
     };
+  
     const entry = map[d.status] || ['bad', d.message || 'Error'];
-    showFlash(entry[0], entry[1], 1300);
+  
+    // Replace processing overlay with the result.
+    showFlash(entry[0], entry[1], RESULT_DISPLAY_MS);
+  
     setStatus(d.message || entry[1]);
-    if (navigator.vibrate) navigator.vibrate(d.status === 'ok' ? 60 : [80, 60, 80]);
+  
+    if (navigator.vibrate) {
+      navigator.vibrate(d.status === 'ok' ? 60 : [80, 60, 80]);
+    }
+  
+    // Wait until the result has been displayed.
+    setTimeout(function () {
+  
+      if (mode === 'single') {
+        // Close only after receiving and displaying the result.
+        window.close();
+  
+        // Fallback for browsers that block window.close().
+        if (!window.closed) {
+          setStatus('Result received. You can close this window.');
+        }
+  
+      } else {
+        // Allow scanning again in continuous mode.
+        activeScanId = null;
+  
+        // Prevent immediately scanning the same QR code again.
+        lastSeen.set(current.msg.text, Date.now());
+  
+        setStatus('Scanning… keep the check-in tab open.');
+      }
+  
+    }, RESULT_DISPLAY_MS);
   }
 
-  // Resend scans that have not been acknowledged (e.g. the app tab was in the background).
+  // Resend unacknowledged scans using the same scan ID.
   setInterval(function () {
     pending.forEach(function (p, id) {
-      if (p.tries >= MAX_TRIES) {
-        pending.delete(id);
-        showFlash('bad', 'No response from the app. Keep the check-in tab open.', 2500);
+  
+      if (!post(p.msg)) {
+        setStatus('Connection to the check-in app lost.', true);
         return;
       }
+  
       p.tries++;
-      post(p.msg);
+  
+      // Inform the user when processing takes unusually long.
+      if (!p.slowNotified && Date.now() - p.startedAt >= 20000) {
+        p.slowNotified = true;
+  
+        showFlash('info', 'Still processing…', 0);
+  
+        setStatus(
+          'The check-in is taking longer than expected. Keep this window open.'
+        );
+      }
+  
     });
   }, RESEND_EVERY_MS);
 
